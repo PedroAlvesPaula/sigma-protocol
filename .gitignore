@@ -49,3 +49,7 @@ article/main.pdf
 /result-*
 /.direnv/
 /bin/
+
+# Arquivos de teste e downloads (podem ter 80 MB ou mais)
+/shared/
+/downloads/

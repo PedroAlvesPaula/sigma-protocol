@@ -100,8 +100,8 @@ confirmação de META não compartilhe o espaço de numeração dos ACKs de dado
 | `0x31` | PING        | diversos       | 4     |
 | `0x32` | PONG        | diversos       | 4     |
 
-Os tipos das etapas 2 e 4 já são reconhecidos pelo codec, mas sua semântica
-será especificada nas respectivas etapas.
+A semântica dos tipos das etapas 2 e 4 (autenticação, operações e
+PING/PONG) está na seção 9.
 
 ## 4. Mensagens de transferência (etapa 1)
 
@@ -241,3 +241,119 @@ sequenceDiagram
 - Controle de fluxo (janela anunciada) não é controle de congestionamento.
 - O limite de 1.200 bytes não garante ausência de fragmentação em todos os
   caminhos.
+
+## 9. Mensagens de controle (etapas 2 e 4)
+
+Implementação: `internal/proto` (payloads), `internal/auth`,
+`internal/control` (retransmissão), `internal/server` e `internal/client`.
+Explicação do fluxo completo em `docs/aplicacao.md`.
+
+### 9.1 Requisição e resposta
+
+Toda mensagem de controle enviada pelo cliente é uma **requisição**; o
+servidor responde com exatamente uma **resposta** (ou ERROR).
+
+- A requisição leva um número em **Sequence**, crescente dentro da sessão
+  (1, 2, 3, ...). A resposta ecoa esse número em **ACK**.
+- O cliente retransmite a requisição se a resposta não chegar: timeout
+  inicial de 500 ms, dobrando até 4 s, no máximo 6 envios (≈ 15 s). Depois
+  disso, erro "servidor não responde".
+- **Idempotência:** o servidor guarda, por sessão, o Sequence e a resposta da
+  última requisição. Requisição repetida (mesmo Sequence) recebe a mesma
+  resposta sem ser reexecutada — um GET retransmitido não inicia uma segunda
+  transferência. Sequence menor que o último é ignorado (atrasado).
+- Datagramas de uma sessão vindos de outro endereço IP/porta são ignorados.
+- Payloads são JSON (UTF-8, ≤ 1.156 bytes, sem escape de `<`, `>` e `&`).
+
+| Requisição (cliente) | Session ID | Payload | Resposta (servidor) | Payload da resposta |
+| -------------------- | ---------- | ------- | ------------------- | ------------------- |
+| HELLO | `0` | vazio | CHALLENGE (Session ID novo) | `{"nonce": "<64 hex>"}` |
+| AUTH | sessão | `{"mac": "<64 hex>"}` | AUTH_OK | vazio |
+| LIST | sessão | `{"offset": 0}` | LIST_RESULT | `{"files": [{"name": "a.bin", "size": 123}], "next": -1}` |
+| GET | sessão | `{"name": "a.bin"}` | META (Transfer ID novo) | JSON de META (seção 4) |
+| PUT | sessão | JSON de META (seção 4) | META_ACK (Transfer ID novo, Receive Window) | vazio |
+| PING | `0` | `{"nonce": "<32 hex>"}` | PONG | o mesmo payload do PING |
+
+Qualquer requisição pode ser respondida com ERROR (`ACK` = Sequence da
+requisição), cujo payload está na seção 4.
+
+### 9.2 Autenticação (HELLO → CHALLENGE → AUTH → AUTH_OK)
+
+1. Cliente envia HELLO com Session ID `0`.
+2. Servidor sorteia um **Session ID** (64 bits, `crypto/rand`, não nulo) e um
+   **nonce** de 32 bytes, e responde CHALLENGE já com o novo Session ID.
+3. Cliente calcula
+   `mac = HMAC-SHA256(chave = SHA-256(senha), mensagem = SessionID (8 bytes big-endian) || nonce)`
+   e envia AUTH.
+4. Servidor recalcula e compara com `hmac.Equal` (tempo constante):
+   igual → AUTH_OK e a sessão fica autenticada; diferente → ERROR
+   `AUTH_FAILED` e o nonce é descartado (a sessão não pode mais ser
+   autenticada; o cliente recomeça com HELLO).
+
+A senha nunca trafega. O nonce é de uso único, então uma resposta capturada
+não serve para outra sessão. LIST, GET e PUT em sessão não autenticada,
+inexistente ou expirada (2 min sem tráfego) → ERROR `NOT_AUTHENTICATED`.
+
+### 9.3 LIST paginado
+
+`offset` é o índice do primeiro arquivo pedido. O servidor coloca na página
+o máximo de entradas que couber em 1.156 bytes; `next` é o `offset` da
+próxima página ou `-1` na última. Só arquivos regulares do diretório
+compartilhado aparecem (sem subdiretórios, links simbólicos, ocultos ou
+temporários), ordenados por nome.
+
+### 9.4 Download (GET) e upload (PUT)
+
+META e META_ACK fazem parte da negociação de controle; o transporte
+(seção 4) começa no primeiro DATA.
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente
+    participant S as Servidor
+    Note over C,S: Download
+    C->>S: GET seq=7 {"name": "a.bin"}
+    S->>C: META ack=7, Transfer ID=T (nome, tamanho, sha256)
+    S->>C: DATA / FIN (servidor é o emissor)
+    C->>S: ACK / FIN_ACK (cliente confere o SHA-256 antes do FIN_ACK)
+    Note over C,S: Upload
+    C->>S: PUT seq=8 (META do arquivo local)
+    S->>C: META_ACK ack=8, Transfer ID=U, Window=W
+    C->>S: DATA / FIN (cliente é o emissor)
+    S->>C: ACK / FIN_ACK ou ERROR HASH_MISMATCH
+```
+
+- **GET:** o servidor responde META e logo em seguida começa a enviar DATA.
+  Se o META se perder, o cliente retransmite o GET e recebe o mesmo META
+  (idempotência); os DATA que chegaram antes são descartados pelo cliente e
+  recuperados pela retransmissão do emissor.
+- **PUT:** o servidor valida o META (nome, tamanho), recusa nome existente
+  (`EXISTS`) e responde META_ACK; a partir daí é o receptor. Se o META_ACK
+  se perder, o cliente retransmite o PUT e recebe o mesmo META_ACK.
+- O receptor grava em arquivo temporário e só publica o arquivo (rename)
+  depois de conferir que o SHA-256 recebido é igual ao do META. Divergência →
+  ERROR `HASH_MISMATCH` no lugar do FIN_ACK, e o temporário é apagado.
+- Depois do fim de um upload, o servidor ainda responde FIN repetido com a
+  resposta final (FIN_ACK ou ERROR) por 10 s.
+
+### 9.5 PING/PONG (mini-CDN)
+
+PING não exige sessão nem autenticação. O PONG repete Sequence (em ACK) e o
+nonce; o cliente só aceita PONG do endereço para o qual enviou o PING, com o
+Sequence e o nonce corretos. O RTT é medido no relógio monotônico do
+cliente. Algoritmo de escolha em `docs/aplicacao.md`.
+
+### 9.6 Códigos de ERROR
+
+| Código | Quando |
+| ------ | ------ |
+| `AUTH_FAILED` | senha incorreta |
+| `NOT_AUTHENTICATED` | sessão inexistente, expirada ou não autenticada |
+| `BAD_REQUEST` | payload malformado, nome inválido (`..`, `/`, ponto inicial, ...) |
+| `NOT_FOUND` | arquivo inexistente |
+| `EXISTS` | PUT de um nome que já existe |
+| `TOO_LARGE` | arquivo acima de `(2^32 − 1) · 1156` bytes |
+| `HASH_MISMATCH` | SHA-256 recebido difere do original |
+| `NO_SPACE` | disco cheio no receptor |
+| `BUSY` | limite de sessões (64) ou de transferências simultâneas (16) |
+| `TIMEOUT`, `INTERNAL` | par parou de responder / falha inesperada |
